@@ -44,7 +44,11 @@ jobs:
           TG_TOKEN: ${{ secrets.TELEGRAM_BOT_TOKEN }}
           TG_CHAT: ${{ secrets.TELEGRAM_CHAT_ID }}
         run: |
-          set -u
+          # NOT -e: GitHub's default stops the script at the first failing
+          # command, and a watchdog must outlive any one bad reply. (The
+          # check runs in this shell, not a subshell, so it remembers what it
+          # already sent.)
+          set +e -u
           R="${GITHUB_REPOSITORY}"; OWNER="@${GITHUB_REPOSITORY_OWNER}"
           SILENT=2400; EVERY=600; UNTIL=$(( $(date +%s) + 19800 ))
           # A SECOND MEMORY, inside the run: the open issue is the memory
@@ -60,8 +64,15 @@ jobs:
             echo "telegram ${code}"
           }
           check() {
-            last=$(gh api "repos/${R}/commits/pulse" --jq .commit.committer.date 2>/dev/null || true)
-            [ -n "$last" ] || { echo "no pulse yet"; return; }
+            # ONLY A DATE IS A DATE: on a missing branch `gh api` prints its
+            # error JSON to stdout, which went into the date arithmetic and
+            # ended the whole loop -- the very first run lasted 2 s
+            # (2026-10-31).
+            last=$(gh api "repos/${R}/commits/pulse" --jq .commit.committer.date 2>/dev/null) || last=""
+            case "$last" in
+              [12][0-9][0-9][0-9]-[01][0-9]-[0-3][0-9]T*) ;;
+              *) echo "no readable pulse (${last:0:60})"; return 0 ;;
+            esac
             age=$(( $(date +%s) - $(date -d "$last" +%s) )); mins=$(( age / 60 ))
             open=$(gh issue list -R "$R" --state open --limit 50 --json number,title,updatedAt \
               --jq '[.[] | select(.title | startswith("Pulse missing"))][0] // empty' 2>/dev/null || true)
@@ -88,8 +99,10 @@ jobs:
               TOLD=0; BACK=1
             fi
           }
+          # A failed check never ends the watch: it is logged and the next one
+          # comes 10 minutes later.
           while [ "$(date +%s)" -lt "$UNTIL" ]; do
-            check
+            check || echo "::warning::a check failed at $(date -u +%H:%M); next in 10 min"
             sleep "$EVERY"
           done
           # The next link in the chain. If this fails, the schedule above
