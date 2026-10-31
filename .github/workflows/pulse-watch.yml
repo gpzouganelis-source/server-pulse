@@ -1,0 +1,98 @@
+# The outside watchdog that does not wait for GitHub's timetable (2026-10-31,
+# weak spot 2b). Lives in the PUBLIC repo `server-pulse`; source in the
+# project at vps-deploy/github-pulse/, installed by install-pulse.sh.
+#
+# WHY PUBLIC, AND WHY A LOOP. The private backups repo's watchdog is a short
+# scheduled check, and GitHub ran it twice in thirteen hours. Public repos get
+# unlimited Actions minutes, so this one simply never stops: one run watches
+# for ~5.5 hours, checking every 10 minutes, then starts the next run itself
+# (a workflow_dispatch from GITHUB_TOKEN is allowed to start a run). The
+# schedule and a push to the workflow are only there to restart the chain if
+# it ever breaks. Concurrency keeps it to one at a time.
+#
+# WHAT IS PUBLIC: the `pulse` branch (one commit, a timestamp), this file, the
+# run logs (times and minutes only), and an issue while the server is silent.
+# No backups, no figures, no names. The two Telegram secrets stay hidden.
+#
+# Silence = no pulse for 40 minutes (the server pushes every 15 while its
+# agent is alive; a deploy or the weekly patch reboot takes a few minutes).
+# Then: ONE Telegram and an issue that @mentions the owner (GitHub emails it),
+# a repeat once a day while it lasts, and one "back" message when it ends.
+name: pulse watch
+on:
+  push:
+    branches: [main]
+    paths: [.github/workflows/pulse-watch.yml]
+  schedule:
+    - cron: "11 */6 * * *"
+  workflow_dispatch: {}
+concurrency:
+  group: pulse-watch
+  cancel-in-progress: false
+permissions:
+  contents: read
+  issues: write
+  actions: write
+jobs:
+  watch:
+    runs-on: ubuntu-latest
+    timeout-minutes: 350
+    steps:
+      - name: Watch the server's pulse
+        env:
+          GH_TOKEN: ${{ github.token }}
+          TG_TOKEN: ${{ secrets.TELEGRAM_BOT_TOKEN }}
+          TG_CHAT: ${{ secrets.TELEGRAM_CHAT_ID }}
+        run: |
+          set -u
+          R="${GITHUB_REPOSITORY}"; OWNER="@${GITHUB_REPOSITORY_OWNER}"
+          SILENT=2400; EVERY=600; UNTIL=$(( $(date +%s) + 19800 ))
+          # A SECOND MEMORY, inside the run: the open issue is the memory
+          # across runs, but if creating it ever failed (issues switched off,
+          # an API hiccup) every 10-minute check would message again. So a
+          # silence alarm is also held here for 24 h.
+          TOLD=0; BACK=0
+          tell() {
+            [ -n "$TG_TOKEN" ] && [ -n "$TG_CHAT" ] || { echo "::warning::Telegram secrets missing"; return; }
+            code=$(curl -s -m 20 "https://api.telegram.org/bot${TG_TOKEN}/sendMessage" \
+              --data-urlencode "chat_id=${TG_CHAT}" --data-urlencode "text=$1" \
+              -o /dev/null -w "%{http_code}" || true)
+            echo "telegram ${code}"
+          }
+          check() {
+            last=$(gh api "repos/${R}/commits/pulse" --jq .commit.committer.date 2>/dev/null || true)
+            [ -n "$last" ] || { echo "no pulse yet"; return; }
+            age=$(( $(date +%s) - $(date -d "$last" +%s) )); mins=$(( age / 60 ))
+            open=$(gh issue list -R "$R" --state open --limit 50 --json number,title,updatedAt \
+              --jq '[.[] | select(.title | startswith("Pulse missing"))][0] // empty' 2>/dev/null || true)
+            num=$(printf '%s' "$open" | jq -r '.number // empty' 2>/dev/null || true)
+            echo "$(date -u +%H:%M) pulse ${mins} min old"
+            if [ "$age" -ge "$SILENT" ]; then
+              BACK=0
+              if [ -z "$num" ] && [ "$TOLD" -eq 0 ]; then
+                gh issue create -R "$R" --title "Pulse missing since ${last}" \
+                  --body "${OWNER} the server has sent no heartbeat for ${mins} minutes (last ${last}). Orders already at IBKR are safe. This closes itself, with a second email, when the heartbeat returns. Tell Claude." || true
+                tell "🛑 SERVER SILENT (outside watchdog): no heartbeat for ${mins} min, last at ${last}. Its own alarms may be down with it. Orders already at IBKR are safe."
+                TOLD=$(date +%s)
+              elif [ -n "$num" ] && [ $(( $(date +%s) - TOLD )) -ge 86400 ]; then
+                upd=$(printf '%s' "$open" | jq -r .updatedAt)
+                if [ $(( $(date +%s) - $(date -d "$upd" +%s) )) -ge 86400 ]; then
+                  gh issue comment -R "$R" "$num" --body "${OWNER} still silent: ${mins} minutes since the last heartbeat (${last})." || true
+                  tell "🛑 SERVER STILL SILENT: ${mins} min since the last heartbeat (${last})."
+                  TOLD=$(date +%s)
+                fi
+              fi
+            elif { [ -n "$num" ] || [ "$TOLD" -gt 0 ]; } && [ "$BACK" -eq 0 ]; then
+              [ -n "$num" ] && { gh issue close -R "$R" "$num" --comment "${OWNER} the server is back: heartbeat at ${last}." || true; }
+              tell "✅ Server back: heartbeat at ${last}."
+              TOLD=0; BACK=1
+            fi
+          }
+          while [ "$(date +%s)" -lt "$UNTIL" ]; do
+            check
+            sleep "$EVERY"
+          done
+          # The next link in the chain. If this fails, the schedule above
+          # restarts it within six hours, and the server itself reports a
+          # watchdog that has not run for two (heartbeat.sh).
+          gh workflow run pulse-watch.yml -R "$R" --ref main || echo "::warning::could not start the next run"
