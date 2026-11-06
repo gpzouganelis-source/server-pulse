@@ -80,7 +80,21 @@ jobs:
             echo "$(date -u +%H:%M) pulse ${mins} min old"
             if [ "$age" -ge "$SILENT" ]; then
               BACK=0
-              if [ -z "$num" ] && [ "$TOLD" -eq 0 ]; then
+              # GITHUB'S OWN OUTAGE IS NOT THE SERVER'S SILENCE (2026-11-04).
+              # During GitHub's "Git Operations and Issues" incident the box
+              # could not push and this watchdog could not keep its issue
+              # memory, so the owner got "SERVER SILENT" twice for a healthy
+              # box. If githubstatus.com reports an open incident, say THAT,
+              # once per run, as a note -- no red alarm, no issue; the box
+              # sends its own "GitHub is having trouble" message when it can.
+              gh_inc=$(curl -s -m 15 https://www.githubstatus.com/api/v2/incidents/unresolved.json \
+                | jq -r '[.incidents[].name] | join("; ")' 2>/dev/null || true)
+              if [ -n "$gh_inc" ]; then
+                if [ "$TOLD" -eq 0 ]; then
+                  tell "🟡 No heartbeat from the server for ${mins} min, but GitHub itself reports an outage (${gh_inc}), which blocks the heartbeat. The server is most likely fine; it sends its own note when it can. Orders already at IBKR are safe."
+                  TOLD=$(date +%s)
+                fi
+              elif [ -z "$num" ] && [ "$TOLD" -eq 0 ]; then
                 gh issue create -R "$R" --title "Pulse missing since ${last}" \
                   --body "${OWNER} the server has sent no heartbeat for ${mins} minutes (last ${last}). Orders already at IBKR are safe. This closes itself, with a second email, when the heartbeat returns. Tell Claude." || true
                 tell "🛑 SERVER SILENT (outside watchdog): no heartbeat for ${mins} min, last at ${last}. Its own alarms may be down with it. Orders already at IBKR are safe."
